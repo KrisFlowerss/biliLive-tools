@@ -21,11 +21,51 @@ interface Config {
   passKey?: string;
 }
 
+const DOCKER_UNHEALTHY_MARKER = "/tmp/bililive-tools-unhealthy";
+
+function shouldRestartDockerContainer(error: unknown) {
+  if (process.env.IS_DOCKER !== "true") {
+    return false;
+  }
+  if (process.env.BILILIVE_TOOLS_RESTART_ON_ECONNRESET === "false") {
+    return false;
+  }
+  if (!(error instanceof Error)) {
+    return false;
+  }
+
+  const nodeError = error as NodeJS.ErrnoException;
+  return (
+    nodeError.code === "ECONNRESET" && ["read", "write"].includes(nodeError.syscall ?? "")
+  );
+}
+
+function exitForDockerRestart(reason: string, error: unknown) {
+  try {
+    fs.writeFileSync(
+      DOCKER_UNHEALTHY_MARKER,
+      `${new Date().toISOString()} ${reason}\n${error instanceof Error ? error.stack : String(error)}\n`,
+    );
+  } catch {
+    // Best effort only: exiting is what lets Docker restart the container.
+  }
+
+  console.error(`${new Date().toISOString()} docker healthcheck restart triggered by ${reason}`);
+  process.exit(1);
+}
+
+
 process.on("uncaughtException", function (error) {
   console.error(`${new Date().toISOString()} uncaughtException`, error);
+  if (shouldRestartDockerContainer(error)) {
+    exitForDockerRestart("uncaughtException ECONNRESET", error);
+  }
 });
 process.on("unhandledRejection", function (error) {
   console.error(`${new Date().toISOString()} unhandledRejection`, error);
+  if (shouldRestartDockerContainer(error)) {
+    exitForDockerRestart("unhandledRejection ECONNRESET", error);
+  }
 });
 
 const program = new Command();
