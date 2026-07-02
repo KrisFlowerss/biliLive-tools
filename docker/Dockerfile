@@ -113,6 +113,8 @@ ENV PUID=0 PGID=0 UMASK=022
 
 EXPOSE 18010
 
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 CMD test ! -f /tmp/bililive-tools-unhealthy && node -e "fetch('http://127.0.0.1:18010/').then((res) => process.exit(res.ok ? 0 : 1)).catch(() => process.exit(1))"
+
 ENTRYPOINT ["/entrypoint.sh"]
 CMD ["node", "index.cjs", "server", "--config", "config.json"]
 
@@ -170,6 +172,8 @@ ENV TZ=Asia/Shanghai
 ENV PUID=0 PGID=0 UMASK=022
 
 EXPOSE 3000
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 CMD test ! -f /tmp/bililive-tools-unhealthy && node -e "fetch('http://127.0.0.1:18010/').then((res) => process.exit(res.ok ? 0 : 1)).catch(() => process.exit(1))"
 
 ENTRYPOINT ["/entrypoint.sh"]
 CMD ["/app/start.sh"]
