@@ -71,12 +71,25 @@ jobs:
             ghcr.io/${{ github.repository_owner }}/bililive-tools:latest
             ghcr.io/${{ github.repository_owner }}/bililive-tools:${{ github.ref_name }}
 
+  manual-tag:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    outputs:
+      build_tag: ${{ steps.build-tag.outputs.build_tag }}
+    steps:
+      - name: Generate datetime tag
+        id: build-tag
+        run: echo "build_tag=$(date -u +'%Y%m%d-%H%M%S')" >> "$GITHUB_OUTPUT"
+
   manual-build:
     if: github.event_name == 'workflow_dispatch'
+    needs: manual-tag
     runs-on: ubuntu-latest
     strategy:
       matrix:
         service: [frontend, backend, fullstack]
+    env:
+      BUILD_TAG: ${{ needs.manual-tag.outputs.build_tag }}
     permissions:
       contents: read
       packages: write
@@ -111,8 +124,8 @@ jobs:
           cache-from: type=gha,scope=${{ matrix.service }}
           cache-to: type=gha,mode=max,scope=${{ matrix.service }}
           tags: |
-            ${{ secrets.DOCKER_USERNAME }}/bililive-tools-${{ matrix.service }}:test
-            ghcr.io/${{ github.repository_owner }}/bililive-tools-${{ matrix.service }}:test
+            ${{ secrets.DOCKER_USERNAME }}/bililive-tools-${{ matrix.service }}:${{ env.BUILD_TAG }}
+            ghcr.io/${{ github.repository_owner }}/bililive-tools-${{ matrix.service }}:${{ env.BUILD_TAG }}
 
       - name: Build and push fullstack image
         uses: docker/build-push-action@v6
@@ -128,5 +141,5 @@ jobs:
             VITE_DEFAULT_SERVER=/api
             VITE_FULLSTACK=true
           tags: |
-            ${{ secrets.DOCKER_USERNAME }}/bililive-tools:test
-            ghcr.io/${{ github.repository_owner }}/bililive-tools:test
+            ${{ secrets.DOCKER_USERNAME }}/bililive-tools:${{ env.BUILD_TAG }}
+            ghcr.io/${{ github.repository_owner }}/bililive-tools:${{ env.BUILD_TAG }}
