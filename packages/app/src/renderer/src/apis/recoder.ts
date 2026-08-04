@@ -21,6 +21,16 @@ const get = async (id: string): Promise<Recorder> => {
   return res.data.payload;
 };
 
+/** 获取供播放器使用的直播流地址。 */
+const getStreamUrl = async (
+  id: string,
+): Promise<{
+  url: string;
+}> => {
+  const res = await request.post(`/recorder/${id}/stream`);
+  return res.data.payload;
+};
+
 const add = async (
   data: RecorderAPI["addRecorder"]["Args"],
 ): Promise<RecorderAPI["addRecorder"]["Resp"]> => {
@@ -125,6 +135,7 @@ const queryStreamerDetail = async (
 const recoder = {
   infoList,
   get,
+  getStreamUrl,
   add,
   remove,
   update,
