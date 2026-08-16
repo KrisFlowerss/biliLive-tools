@@ -43,9 +43,6 @@ interface Events {
 class DouYinDanmaClient extends TypedEmitter<Events> {
   private ws!: WebSocket;
   private roomId: string;
-  private heartbeatInterval: number;
-  private heartbeatTimer!: NodeJS.Timeout;
-  private isHeartbeatRunning: boolean = false;
   private autoStart: boolean;
   private autoReconnect: number;
   private reconnectAttempts: number;
@@ -74,7 +71,6 @@ class DouYinDanmaClient extends TypedEmitter<Events> {
   ) {
     super();
     this.roomId = roomId;
-    this.heartbeatInterval = options.heartbeatInterval ?? 10000;
     this.autoStart = options.autoStart ?? false;
     this.autoReconnect = options.autoReconnect ?? 10;
     this.reconnectAttempts = 0;
@@ -203,37 +199,11 @@ class DouYinDanmaClient extends TypedEmitter<Events> {
   close() {
     this.isStopped = true;
     this.reconnectAttempts = this.autoReconnect;
-    this.stopHeartbeat();
     this.stopTimeoutCheck();
     this.emit("close");
 
     if (this.ws && this.ws.readyState === WebSocket.OPEN) {
       this.ws.close();
-    }
-  }
-
-  private startHeartbeat() {
-    if (this.isHeartbeatRunning) {
-      return;
-    }
-
-    this.stopHeartbeat();
-    this.isHeartbeatRunning = true;
-
-    this.heartbeatTimer = setInterval(() => {
-      if (this.ws.readyState === WebSocket.OPEN) {
-        this.emit("heartbeat");
-        this.send(":\x02hb");
-      } else {
-        console.log("连接未就绪，当前状态:", this.ws.readyState);
-      }
-    }, this.heartbeatInterval);
-  }
-
-  private stopHeartbeat() {
-    if (this.heartbeatTimer) {
-      clearInterval(this.heartbeatTimer);
-      this.isHeartbeatRunning = false;
     }
   }
 
@@ -270,7 +240,6 @@ class DouYinDanmaClient extends TypedEmitter<Events> {
       return;
     }
 
-    this.stopHeartbeat();
     this.stopTimeoutCheck();
 
     if (this.reconnectAttempts < this.autoReconnect) {
