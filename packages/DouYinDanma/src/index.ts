@@ -4,6 +4,7 @@ import { TypedEmitter } from "tiny-typed-emitter";
 import { decompressGzip, getXMsStub, getSignature, getUserUniqueId } from "./utils.js";
 import protobuf from "./proto.js";
 import { getCookie } from "./api.js";
+import { ABogus } from "./abogus.js";
 
 import type {
   ChatMessage,
@@ -56,6 +57,8 @@ class DouYinDanmaClient extends TypedEmitter<Events> {
   private isTimeoutCheckRunning: boolean = false;
   private isReconnecting: boolean = false;
   private host: string;
+  /** 是否已停止（fetch 轮询用） */
+  private isStopped: boolean = true;
 
   constructor(
     roomId: string,
@@ -87,44 +90,107 @@ class DouYinDanmaClient extends TypedEmitter<Events> {
   }
 
   async connect() {
-    const url = await this.getWsInfo(this.roomId);
-    if (!url) {
-      this.emit("error", new Error("获取抖音弹幕签名失败"));
-      return;
-    }
-    this.emit("init", url);
+    this.isStopped = false;
+    this.emit("init", "webcast/im/fetch");
     const cookies = this.cookie || (await getCookie());
-    this.ws = new WebSocket(url, {
-      headers: {
-        Cookie: cookies,
-        "User-Agent":
-          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36",
-        Origin: "https://live.douyin.com",
-        Referer: "https://live.douyin.com/",
-      },
-    });
+    const abogus = new ABogus();
+    const userAgent =
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36";
+    let cursor = "0";
+    this.emit("open");
+    this.startTimeoutCheck();
+    try {
+      while (!this.isStopped) {
+        const uid = getUserUniqueId();
+        const now = Date.now();
+        const params = this.buildFetchParams(this.roomId, cursor, uid, now, userAgent);
+        const [query] = abogus.generateAbogus(params, "");
+        const resp = await fetch(`https://live.douyin.com/webcast/im/fetch/?${query}`, {
+          headers: { cookie: cookies, "User-Agent": userAgent, Referer: "https://live.douyin.com/" },
+        });
+        const buf = new Uint8Array(await resp.arrayBuffer());
+        const payloadPackage = (protobuf as any).douyin.Response.decode(buf);
+        if (payloadPackage.cursor) cursor = payloadPackage.cursor;
+        this.lastMessageTime = Date.now();
+        this.processResponse(payloadPackage);
+        const interval = Math.max(payloadPackage.fetchInterval || 0, 1000);
+        await new Promise((r) => setTimeout(r, interval));
+      }
+    } catch (error) {
+      if (!this.isStopped) {
+        this.emit("error", error as Error);
+        this.reconnect();
+      }
+    }
+  }
 
-    this.ws.on("open", () => {
-      this.reconnectAttempts = 0;
-      this.emit("open");
-      this.startHeartbeat();
-      this.startTimeoutCheck();
-    });
+  /** 构建 im/fetch 参数（a_bogus 签名 + resp_content_type=protobuf，对齐浏览器当前请求） */
+  private buildFetchParams(
+    roomId: string,
+    cursor: string,
+    uid: string,
+    now: number,
+    ua: string,
+  ): string {
+    // encodeURIComponent 不编码 !'()*，补上以对齐浏览器全量 %XX 编码
+    const uaEnc = encodeURIComponent(ua).replace(/[!'()*]/g, (c) =>
+      "%" + c.charCodeAt(0).toString(16).toUpperCase(),
+    );
+    return `resp_content_type=protobuf&did_rule=3&device_id=&app_name=douyin_web&endpoint=live_pc&support_wrds=1&user_unique_id=${uid}&identity=audience&need_persist_msg_count=15&insert_task_id=&live_reason=&room_id=${roomId}&version_code=180800&last_rtt=1655&live_id=1&aid=6383&fetch_rule=1&cursor=${cursor}&internal_ext=internal_src%3Apushserver%7Cfirst_req_ms%3A${now}%7Cseq%3A1%7Cwss_msg_type%3Ar%7Cwrds_v%3A0&device_platform=web&cookie_enabled=true&screen_width=1280&screen_height=800&browser_language=zh-CN&browser_platform=MacIntel&browser_name=Mozilla&browser_version=${uaEnc}&browser_online=true&tz_name=Asia%2FShanghai`;
+  }
 
-    this.ws.on("message", (data) => {
-      this.lastMessageTime = Date.now();
-      this.decode(data as Buffer);
-    });
-
-    this.ws.on("close", () => {
-      this.emit("close");
-      this.reconnect();
-    });
-
-    this.ws.on("error", (error) => {
-      this.emit("error", error);
-      this.reconnect();
-    });
+  /** 处理 Response protobuf 的 messagesList（对齐原 decode 的消息分发） */
+  private processResponse(payloadPackage: any) {
+    const douyin = (protobuf as any).douyin;
+    const ChatMessage = douyin.ChatMessage;
+    const RoomUserSeqMessage = douyin.RoomUserSeqMessage;
+    const MemberMessage = douyin.MemberMessage;
+    const GiftMessage = douyin.GiftMessage;
+    const LikeMessage = douyin.LikeMessage;
+    const SocialMessage = douyin.SocialMessage;
+    const RoomStatsMessage = douyin.RoomStatsMessage;
+    const RoomRankMessage = douyin.RoomRankMessage;
+    const PrivilegeScreenChatMessage = douyin.PrivilegeScreenChatMessage;
+    const ScreenChatMessage = douyin.ScreenChatMessage;
+    for (const msg of payloadPackage.messagesList) {
+      try {
+        if (msg.method === "WebcastChatMessage") {
+          const chatMessage = ChatMessage.decode(msg.payload);
+          this.handleChatMessage(chatMessage.toJSON() as ChatMessage);
+        } else if (msg.method === "WebcastMemberMessage") {
+          const memberMessage = MemberMessage.decode(msg.payload);
+          this.handleEnterRoomMessage(memberMessage.toJSON() as MemberMessage);
+        } else if (msg.method === "WebcastGiftMessage") {
+          const giftMessage = GiftMessage.decode(msg.payload);
+          this.handleGiftMessage(giftMessage.toJSON() as GiftMessage);
+        } else if (msg.method === "WebcastLikeMessage") {
+          const message = LikeMessage.decode(msg.payload);
+          this.handleLikeMessage(message.toJSON() as LikeMessage);
+        } else if (msg.method === "WebcastSocialMessage") {
+          const message = SocialMessage.decode(msg.payload);
+          this.handleSocialMessage(message.toJSON() as SocialMessage);
+        } else if (msg.method === "WebcastRoomUserSeqMessage") {
+          const message = RoomUserSeqMessage.decode(msg.payload);
+          this.handleRoomUserSeqMessage(message.toJSON() as RoomUserSeqMessage);
+        } else if (msg.method === "WebcastRoomStatsMessage") {
+          const message = RoomStatsMessage.decode(msg.payload);
+          this.handleRoomStatsMessage(message.toJSON() as RoomStatsMessage);
+        } else if (msg.method === "WebcastRoomRankMessage") {
+          const message = RoomRankMessage.decode(msg.payload);
+          this.handleRoomRankMessage(message.toJSON() as RoomRankMessage);
+        } else if (msg.method === "WebcastPrivilegeScreenChatMessage") {
+          const message = PrivilegeScreenChatMessage.decode(msg.payload);
+          this.handlePrivilegeScreenChatMessage(message.toJSON() as PrivilegeScreenChatMessage);
+        } else if (msg.method === "WebcastScreenChatMessage") {
+          const message = ScreenChatMessage.decode(msg.payload);
+          this.handleScreenChatMessage(message.toJSON() as ScreenChatMessage);
+        } else {
+          // WebcastRanklistHourEntranceMessage 等
+        }
+      } catch (e) {
+        console.error("error:", e, msg);
+      }
+    }
   }
 
   send(data: any) {
@@ -135,14 +201,13 @@ class DouYinDanmaClient extends TypedEmitter<Events> {
   }
 
   close() {
-    if (!this.ws) {
-      return;
-    }
+    this.isStopped = true;
     this.reconnectAttempts = this.autoReconnect;
     this.stopHeartbeat();
     this.stopTimeoutCheck();
+    this.emit("close");
 
-    if (this.ws.readyState === WebSocket.OPEN) {
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
       this.ws.close();
     }
   }

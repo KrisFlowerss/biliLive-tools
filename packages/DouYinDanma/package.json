@@ -39,7 +39,8 @@
   "dependencies": {
     "protobufjs": "^7.4.0",
     "tiny-typed-emitter": "^2.1.0",
-    "ws": "^8.18.0"
+    "ws": "^8.18.0",
+    "sm-crypto": "*"
   },
   "devDependencies": {
     "@types/node": "*",
