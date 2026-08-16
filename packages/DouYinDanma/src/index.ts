@@ -20,6 +20,10 @@ import type {
   ScreenChatMessage,
 } from "../types/types.js";
 
+const DOUYIN_WEB_UA =
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36";
+const DOUYIN_WS_ORIGIN = "https://live.douyin.com";
+
 interface Events {
   init: (url: string) => void;
   open: () => void;
@@ -54,8 +58,20 @@ class DouYinDanmaClient extends TypedEmitter<Events> {
   private isTimeoutCheckRunning: boolean = false;
   private isReconnecting: boolean = false;
   private host: string;
-  /** 是否已停止（fetch 轮询用） */
+  /** 是否已停止 */
   private isStopped: boolean = true;
+  /** 当前通道：ws（WSS 推送） | fetch（im/fetch 长轮询） */
+  private mode: "ws" | "fetch";
+  /** ws 握手连续失败次数，达到 maxWsFailures 后永久退回 fetch */
+  private wsConnectFailures: number = 0;
+  private readonly maxWsFailures: number;
+  private readonly wsConnectTimeout: number;
+  /** 握手阶段挂起的 Promise，open/close/超时只结算一次 */
+  private openResolve: ((ok: boolean) => void) | null = null;
+  private wsOpened: boolean = false;
+  private heartbeatInterval: number;
+  private heartbeatTimer!: NodeJS.Timeout;
+  private isHeartbeatRunning: boolean = false;
 
   constructor(
     roomId: string,
@@ -67,6 +83,12 @@ class DouYinDanmaClient extends TypedEmitter<Events> {
       cookie?: string;
       timeoutInterval?: number;
       host?: string;
+      /** ws（默认，WSS 推送，失败后退回 fetch） | fetch（im/fetch 长轮询） */
+      mode?: "ws" | "fetch";
+      /** ws 握手连续失败多少次后切 fetch，默认 20 */
+      maxWsFailures?: number;
+      /** ws 握手超时（毫秒），默认 10000 */
+      wsConnectTimeout?: number;
     } = {},
   ) {
     super();
@@ -79,6 +101,10 @@ class DouYinDanmaClient extends TypedEmitter<Events> {
     this.timeoutInterval = options.timeoutInterval ?? 100000; // 默认100秒
     this.lastMessageTime = Date.now();
     this.host = options.host ?? "webcast100-ws-web-hl.douyin.com";
+    this.mode = options.mode === "fetch" ? "fetch" : "ws";
+    this.maxWsFailures = options.maxWsFailures ?? 20;
+    this.wsConnectTimeout = options.wsConnectTimeout ?? 10000;
+    this.heartbeatInterval = options.heartbeatInterval ?? 10000;
 
     if (this.autoStart) {
       this.connect();
@@ -87,11 +113,101 @@ class DouYinDanmaClient extends TypedEmitter<Events> {
 
   async connect() {
     this.isStopped = false;
+
+    // fetch 模式：直接走 im/fetch 长轮询
+    if (this.mode === "fetch") {
+      await this.connectFetch();
+      return;
+    }
+
+    // ws 模式（默认）：webmssdk 签名 + WSS 推送，握手连续失败多次后永久退回 fetch
+    const ok = await this.connectWebSocket();
+    if (this.isStopped || ok) return;
+
+    this.wsConnectFailures += 1;
+    if (this.wsConnectFailures >= this.maxWsFailures) {
+      this.mode = "fetch";
+    }
+    // ws 握手失败要重试到 maxWsFailures 次，不能受 autoReconnect(默认10) 提前掐断
+    this.reconnect(Math.max(this.autoReconnect, this.maxWsFailures));
+  }
+
+  /** WSS 推送模式：webmssdk 签名建立 /webcast/im/push/v2/ 连接 */
+  private async connectWebSocket(): Promise<boolean> {
+    try {
+      const url = await this.getWsInfo(this.roomId);
+      if (!url) {
+        throw new Error("获取抖音弹幕签名失败（webmssdk）");
+      }
+      this.emit("init", url);
+
+      const cookies = this.cookie || (await getCookie());
+      this.wsOpened = false;
+      this.ws = new WebSocket(url, {
+        headers: {
+          Cookie: cookies,
+          "User-Agent": DOUYIN_WEB_UA,
+          Origin: DOUYIN_WS_ORIGIN,
+          Referer: DOUYIN_WS_ORIGIN + "/",
+        },
+      });
+
+      this.ws.on("open", () => {
+        this.reconnectAttempts = 0;
+        this.wsConnectFailures = 0;
+        this.resolveOpen(true);
+        this.emit("open");
+        this.startHeartbeat();
+        this.startTimeoutCheck();
+      });
+      this.ws.on("message", (data) => {
+        this.lastMessageTime = Date.now();
+        try {
+          this.decode(data as Buffer);
+        } catch (error) {
+          this.emit("error", error as Error);
+        }
+      });
+      this.ws.on("error", (error) => {
+        this.emit("error", error as Error);
+      });
+      this.ws.on("close", (code, reason) => {
+        this.stopHeartbeat();
+        this.stopTimeoutCheck();
+        const wasOpened = this.wsOpened;
+        this.resolveOpen(false);
+        if (this.isStopped) return;
+        this.emit("close");
+        // 已成功连接后中途断开才自动重连；握手阶段失败由 connect() 兜底
+        if (wasOpened) {
+          this.reconnect();
+        }
+      });
+
+      return await new Promise<boolean>((resolve) => {
+        this.openResolve = resolve;
+        setTimeout(() => this.resolveOpen(false), this.wsConnectTimeout);
+      });
+    } catch (error) {
+      this.emit("error", error as Error);
+      return false;
+    }
+  }
+
+  /** 关闭连接握手阶段挂起的 Promise，只结算一次 */
+  private resolveOpen(ok: boolean) {
+    if (!this.openResolve) return;
+    const resolve = this.openResolve;
+    this.openResolve = null;
+    if (ok) this.wsOpened = true;
+    resolve(ok);
+  }
+
+  /** im/fetch 长轮询模式（a_bogus 签名） */
+  private async connectFetch(): Promise<void> {
     this.emit("init", "webcast/im/fetch");
     const cookies = this.cookie || (await getCookie());
     const abogus = new ABogus();
-    const userAgent =
-      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36";
     let cursor = "0";
     this.emit("open");
     this.startTimeoutCheck();
@@ -99,10 +215,14 @@ class DouYinDanmaClient extends TypedEmitter<Events> {
       while (!this.isStopped) {
         const uid = getUserUniqueId();
         const now = Date.now();
-        const params = this.buildFetchParams(this.roomId, cursor, uid, now, userAgent);
+        const params = this.buildFetchParams(this.roomId, cursor, uid, now, DOUYIN_WEB_UA);
         const [query] = abogus.generateAbogus(params, "");
         const resp = await fetch(`https://live.douyin.com/webcast/im/fetch/?${query}`, {
-          headers: { cookie: cookies, "User-Agent": userAgent, Referer: "https://live.douyin.com/" },
+          headers: {
+            cookie: cookies,
+            "User-Agent": DOUYIN_WEB_UA,
+            Referer: "https://live.douyin.com/",
+          },
         });
         const buf = new Uint8Array(await resp.arrayBuffer());
         const payloadPackage = (protobuf as any).douyin.Response.decode(buf);
@@ -199,11 +319,37 @@ class DouYinDanmaClient extends TypedEmitter<Events> {
   close() {
     this.isStopped = true;
     this.reconnectAttempts = this.autoReconnect;
+    this.stopHeartbeat();
     this.stopTimeoutCheck();
     this.emit("close");
 
     if (this.ws && this.ws.readyState === WebSocket.OPEN) {
       this.ws.close();
+    }
+  }
+
+  /** WSS 心跳，每 heartbeatInterval 毫秒发送一次 */
+  private startHeartbeat() {
+    if (this.isHeartbeatRunning) {
+      return;
+    }
+    this.stopHeartbeat();
+    this.isHeartbeatRunning = true;
+
+    this.heartbeatTimer = setInterval(() => {
+      if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+        this.emit("heartbeat");
+        this.send(":\x02hb");
+      } else {
+        console.log("连接未就绪，当前状态:", this.ws?.readyState ?? "no ws");
+      }
+    }, this.heartbeatInterval);
+  }
+
+  private stopHeartbeat() {
+    if (this.heartbeatTimer) {
+      clearInterval(this.heartbeatTimer);
+      this.isHeartbeatRunning = false;
     }
   }
 
@@ -235,14 +381,15 @@ class DouYinDanmaClient extends TypedEmitter<Events> {
     }
   }
 
-  private reconnect() {
+  private reconnect(maxAttempts: number = this.autoReconnect) {
     if (this.isReconnecting) {
       return;
     }
 
+    this.stopHeartbeat();
     this.stopTimeoutCheck();
 
-    if (this.reconnectAttempts < this.autoReconnect) {
+    if (this.reconnectAttempts < maxAttempts) {
       this.isReconnecting = true;
       this.reconnectAttempts++;
       setTimeout(() => {
