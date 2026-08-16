@@ -148,8 +148,8 @@ export class TikTokDanmaClient extends EventEmitter {
 
       const comment: Comment = {
         type: "comment",
-        // 默认使用本地时间戳
-        timestamp: new Date().getTime() || getTimestamp(data.common?.createTime),
+        // 优先使用服务端 createTime（秒/毫秒兼容），缺失时回退本地时间戳
+        timestamp: getTimestamp(data.common?.createTime),
         text,
         sender: {
           uid: data.user?.id == null ? undefined : String(data.user.id),
