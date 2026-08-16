@@ -294,6 +294,8 @@ const checkLiveStatusAndRecord: Recorder["checkLiveStatusAndRecord"] = async fun
 
   const client = new DouYinDanmaClient(this?.liveInfo?.liveId as string, {
     cookie: this.auth,
+    // 开启调试级别时打印 WS 帧解码诊断，用于定位容器/网络侧截断
+    debug: this.debugLevel !== "none",
   });
   client.on("chat", (msg) => {
     const extraDataController = downloader.getExtraDataController();

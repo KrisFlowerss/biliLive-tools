@@ -65,7 +65,12 @@ class DouYinDanmaClient extends TypedEmitter<Events> {
   /** ws 握手连续失败次数，达到 maxWsFailures 后永久退回 fetch */
   private wsConnectFailures: number = 0;
   private readonly maxWsFailures: number;
+  /** ws 已连接但数据帧连续解析失败次数，达到 maxWsDecodeFailures 后切 fetch */
+  private wsDecodeFailures: number = 0;
+  private readonly maxWsDecodeFailures: number;
   private readonly wsConnectTimeout: number;
+  /** 调试模式：打印 WS 帧解码诊断，用于定位容器/网络侧截断 */
+  private readonly debug: boolean;
   /** 握手阶段挂起的 Promise，open/close/超时只结算一次 */
   private openResolve: ((ok: boolean) => void) | null = null;
   private wsOpened: boolean = false;
@@ -87,8 +92,12 @@ class DouYinDanmaClient extends TypedEmitter<Events> {
       mode?: "ws" | "fetch";
       /** ws 握手连续失败多少次后切 fetch，默认 20 */
       maxWsFailures?: number;
+      /** ws 已连接但数据帧连续解析失败多少次后切 fetch，默认 10 */
+      maxWsDecodeFailures?: number;
       /** ws 握手超时（毫秒），默认 10000 */
       wsConnectTimeout?: number;
+      /** 调试：打印 WS 帧解码诊断（帧长/isBinary/payload长/gunzip错误） */
+      debug?: boolean;
     } = {},
   ) {
     super();
@@ -103,7 +112,9 @@ class DouYinDanmaClient extends TypedEmitter<Events> {
     this.host = options.host ?? "webcast100-ws-web-hl.douyin.com";
     this.mode = options.mode === "fetch" ? "fetch" : "ws";
     this.maxWsFailures = options.maxWsFailures ?? 20;
+    this.maxWsDecodeFailures = options.maxWsDecodeFailures ?? 10;
     this.wsConnectTimeout = options.wsConnectTimeout ?? 10000;
+    this.debug = options.debug ?? false;
     this.heartbeatInterval = options.heartbeatInterval ?? 10000;
 
     if (this.autoStart) {
@@ -155,18 +166,45 @@ class DouYinDanmaClient extends TypedEmitter<Events> {
       this.ws.on("open", () => {
         this.reconnectAttempts = 0;
         this.wsConnectFailures = 0;
+        this.wsDecodeFailures = 0;
         this.resolveOpen(true);
         this.emit("open");
         this.startHeartbeat();
         this.startTimeoutCheck();
       });
-      this.ws.on("message", (data) => {
+      this.ws.on("message", (data, isBinary) => {
         this.lastMessageTime = Date.now();
-        try {
-          this.decode(data as Buffer);
-        } catch (error) {
-          this.emit("error", error as Error);
-        }
+        // decode 是异步的，用 then/catch 感知「数据帧解析失败」：
+        // WS 连上但帧连续解不开（如容器里 gzip 截断 → unexpected end of file）
+        // 说明这条 WS 通道是坏的，连续失败后切回 im/fetch
+        this.decode(data as Buffer)
+          .then(() => {
+            this.wsDecodeFailures = 0;
+            if (this.debug) {
+              const buf = Buffer.isBuffer(data) ? data : Buffer.from(data as any);
+              console.log(`[danma-debug] ws 帧解码成功 len=${buf.length} isBinary=${isBinary}`);
+            }
+          })
+          .catch((error) => {
+            this.wsDecodeFailures += 1;
+            this.emit("error", error as Error);
+            if (this.debug) {
+              const buf = Buffer.isBuffer(data) ? data : Buffer.from(data as any);
+              let payloadLen = "?";
+              try {
+                const p = (protobuf as any).douyin.PushFrame.decode(buf);
+                payloadLen = String((p?.payload as Buffer | undefined)?.length ?? "null");
+              } catch {
+                payloadLen = "PushFrame解码失败";
+              }
+              console.error(
+                `[danma-debug] ws 帧解码失败 frameLen=${buf.length} isBinary=${isBinary} payloadLen=${payloadLen} err=${(error as Error).message}`,
+              );
+            }
+            if (this.wsDecodeFailures >= this.maxWsDecodeFailures) {
+              this.fallbackToFetch();
+            }
+          });
       });
       this.ws.on("error", (error) => {
         this.emit("error", error as Error);
@@ -201,6 +239,26 @@ class DouYinDanmaClient extends TypedEmitter<Events> {
     this.openResolve = null;
     if (ok) this.wsOpened = true;
     resolve(ok);
+  }
+
+  /** WS 已连接但数据帧连续解析失败 → 视为坏通道，退回 im/fetch */
+  private fallbackToFetch() {
+    if (this.mode !== "ws") return;
+    this.mode = "fetch";
+    if (this.debug) {
+      console.warn(`[danma-debug] WS 数据帧连续 ${this.maxWsDecodeFailures} 次解析失败，切换到 im/fetch`);
+    }
+    this.wsDecodeFailures = 0;
+    this.wsConnectFailures = 0;
+    this.stopHeartbeat();
+    this.stopTimeoutCheck();
+    // 关闭当前 WS，走 close → reconnect → connect() 的 fetch 分支；
+    // 若 ws 已不在 OPEN 状态则直接重连
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+      this.ws.close();
+    } else {
+      this.reconnect();
+    }
   }
 
   /** im/fetch 长轮询模式（a_bogus 签名） */
@@ -523,8 +581,8 @@ class DouYinDanmaClient extends TypedEmitter<Events> {
         return;
       }
     } catch (e) {
-      this.emit("error", e as Error);
-      return;
+      // 帧解析失败向上抛出，由 ws message 处理器计数并决定是否回退 fetch
+      throw e;
     }
 
     const payloadPackage = Response.decode(decompressed);
