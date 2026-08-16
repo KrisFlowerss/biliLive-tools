@@ -171,7 +171,7 @@ class DouYinDanmaClient extends TypedEmitter<Events> {
       this.ws.on("error", (error) => {
         this.emit("error", error as Error);
       });
-      this.ws.on("close", (code, reason) => {
+      this.ws.on("close", () => {
         this.stopHeartbeat();
         this.stopTimeoutCheck();
         const wasOpened = this.wsOpened;
